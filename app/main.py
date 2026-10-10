@@ -8,6 +8,8 @@ This file was written quickly by a colleague who has left the company. The happy
 works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
+from contextlib import asynccontextmanager
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -16,15 +18,45 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
+import pymongo.errors
 
 load_dotenv()
 
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
-db = client[os.getenv("MONGO_DB", "attendance_db")]
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_DB = os.getenv("MONGO_DB", "attendance_db")
+
+client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
+db = client[MONGO_DB]
 
 IST = timezone(timedelta(hours=5, minutes=30))
+logger = logging.getLogger("uvicorn.error")
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+
+def ensure_indexes():
+    """Idempotently create required indexes across collections."""
+    try:
+        # Collection: employees
+        db.employees.create_index([("emp_code", 1)], unique=True, name="uniq_emp_code")
+        db.employees.create_index([("department", 1), ("joined_on", 1)], name="idx_dept_joined")
+
+        # Collection: attendance_logs
+        db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True, name="uniq_emp_date")
+        db.attendance_logs.create_index([("date", -1), ("emp_code", 1)], name="idx_date_emp")
+        db.attendance_logs.create_index([("emp_code", 1), ("date", 1), ("status", 1)], name="idx_emp_date_status")
+        db.attendance_logs.create_index([("date", 1), ("status", 1)], name="idx_date_status")
+        db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)], name="idx_emp_punch_in")
+        logger.info("MongoDB indexes verified successfully.")
+    except Exception as exc:
+        logger.warning(f"Could not initialize MongoDB indexes at startup: {exc}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    ensure_indexes()
+    yield
+
+
+app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
@@ -71,7 +103,11 @@ class PunchInIn(BaseModel):
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    try:
+        db.command("ping")
+        return {"status": "ok"}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable")
 
 
 @app.post("/employees", status_code=201)
