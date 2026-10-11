@@ -571,8 +571,16 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
 
     changes = {}
     for f in ("status", "punch_in", "punch_out", "work_hours", "late_minutes", "overtime_minutes", "half_day"):
-        old_val = record.get(f)
         new_val = new_values[f]
+
+        if f == "half_day":
+            # DATA_MODEL.md: missing half_day means false
+            old_val = bool(record.get("half_day", False))
+        elif f in ("late_minutes", "overtime_minutes"):
+            # DATA_MODEL.md: missing late/overtime minutes means 0
+            old_val = int(record.get(f, 0) or 0)
+        else:
+            old_val = record.get(f)
 
         if f in ("punch_in", "punch_out"):
             old_ms = dt_to_epoch_ms(old_val)
@@ -606,9 +614,22 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
     }
 
     # Atomic compare-and-swap on history to prevent race condition losing entries
-    existing_history = record.get("history", [])
+    existing_history = record.get("history")
+    if existing_history:
+        cas_filter = {"_id": record["_id"], "history": existing_history}
+    else:
+        # Legacy records missing history or having empty/null history
+        cas_filter = {
+            "_id": record["_id"],
+            "$or": [
+                {"history": {"$exists": False}},
+                {"history": []},
+                {"history": None},
+            ],
+        }
+
     res = db.attendance_logs.update_one(
-        {"_id": record["_id"], "history": existing_history},
+        cas_filter,
         {
             "$set": update_fields,
             "$push": {"history": history_entry},
@@ -1321,9 +1342,21 @@ def build_department_trend_pipeline(department: str, from_date: str, to_date: st
                             ]
                         },
                         {
-                            "$round": [
-                                {"$divide": ["$present_count", "$headcount"]},
-                                4,
+                            "$divide": [
+                                {
+                                    "$floor": {
+                                        "$add": [
+                                            {
+                                                "$multiply": [
+                                                    {"$divide": ["$present_count", "$headcount"]},
+                                                    10000,
+                                                ]
+                                            },
+                                            0.5,
+                                        ]
+                                    }
+                                },
+                                10000,
                             ]
                         },
                         None,
@@ -1357,7 +1390,24 @@ def build_department_trend_pipeline(department: str, from_date: str, to_date: st
                     "$cond": [
                         {"$eq": ["$moving_avg_7d", None]},
                         None,
-                        {"$round": ["$moving_avg_7d", 4]},
+                        {
+                            "$divide": [
+                                {
+                                    "$floor": {
+                                        "$add": [
+                                            {
+                                                "$multiply": [
+                                                    "$moving_avg_7d",
+                                                    10000,
+                                                ]
+                                            },
+                                            0.5,
+                                        ]
+                                    }
+                                },
+                                10000,
+                            ]
+                        },
                     ]
                 },
             }
@@ -1478,6 +1528,12 @@ def get_department_trend(
     else:
         # Strict database-side MongoDB aggregation pipeline in production
         items = list(db.employees.aggregate(pipeline))
+
+    for row in items:
+        if row.get("attendance_rate") is not None:
+            row["attendance_rate"] = float(Decimal(str(row["attendance_rate"])).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
+        if row.get("moving_avg_7d") is not None:
+            row["moving_avg_7d"] = float(Decimal(str(row["moving_avg_7d"])).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
 
     return {"department": department, "items": items}
 

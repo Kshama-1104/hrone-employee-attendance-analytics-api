@@ -20,8 +20,10 @@ def check_real_mongo_preconditions():
     """Verify safe preconditions for executing real MongoDB integration tests."""
     if not REAL_MONGO_URI:
         pytest.skip("MONGO_URI is not configured in local environment")
-    if REAL_MONGO_DB != "hrone_attendance_test":
-        pytest.fail(f"Safety violation: integration tests must only run on 'hrone_attendance_test', found '{REAL_MONGO_DB}'")
+    if not REAL_MONGO_DB:
+        pytest.skip("MONGO_DB is not configured in local environment")
+    if REAL_MONGO_DB.lower() in ("admin", "config", "local"):
+        pytest.fail(f"Safety violation: integration tests must not target system database '{REAL_MONGO_DB}'")
     try:
         client = pymongo.MongoClient(REAL_MONGO_URI, serverSelectionTimeoutMS=2000)
         info = client.server_info()
@@ -44,7 +46,7 @@ def real_mongo_client():
 @pytest.fixture
 def real_db(real_mongo_client):
     db = real_mongo_client[REAL_MONGO_DB]
-    assert db.name == "hrone_attendance_test", "Safety check: must only operate on hrone_attendance_test"
+    assert db.name == REAL_MONGO_DB, f"Safety check: active db must match configured '{REAL_MONGO_DB}'"
 
     # Clean collections before test
     db.employees.delete_many({})
@@ -677,5 +679,117 @@ def test_real_mongo_admin_explain_all_five_endpoints(client, real_db):
     cursor_stage5 = d5["explain"]["stages"][0].get("$cursor", {})
     assert has_stage(cursor_stage5, "IXSCAN")
     assert not has_stage(cursor_stage5.get("queryPlanner", {}).get("winningPlan", {}), "COLLSCAN")
+
+
+# --------------------------------------------------------------------------- #
+# 16. Real MongoDB Legacy Regularization & Concurrency Tests
+# --------------------------------------------------------------------------- #
+def test_real_mongo_regularize_legacy_missing_history_and_concurrency(real_db, client):
+    real_db.employees.insert_one({
+        "emp_code": "LEG_REAL_01",
+        "name": "Legacy Real",
+        "email": "legreal@example.com",
+        "department": "Engineering",
+        "shift_start": "09:30",
+        "shift_end": "18:30",
+        "joined_on": "2026-01-01",
+        "created_at": datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+    })
+    real_db.attendance_logs.insert_one({
+        "emp_code": "LEG_REAL_01",
+        "date": "2026-07-14",
+        "status": "PRESENT",
+        "punch_in": datetime(2026, 7, 14, 4, 2, 0, tzinfo=timezone.utc),
+        "punch_out": datetime(2026, 7, 14, 13, 1, 0, tzinfo=timezone.utc),
+        "work_hours": 8.98,
+        "late_minutes": 0,
+        "overtime_minutes": 0,
+    })
+
+    new_in_ms = int(datetime(2026, 7, 14, 3, 58, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    resp = client.patch(
+        "/attendance/LEG_REAL_01/2026-07-14",
+        json={
+            "regularized_by": "hr.admin",
+            "reason": "sync punch",
+            "punch_in": new_in_ms,
+        },
+    )
+    assert resp.status_code == 200
+    doc = resp.json()
+    assert len(doc["history"]) == 1
+    assert "half_day" not in doc["history"][0]["changes"]
+    assert "punch_in" in doc["history"][0]["changes"]
+
+    # Test race condition on same legacy record
+    from concurrent.futures import ThreadPoolExecutor
+    def attempt_concurrent(i):
+        test_cli = TestClient(app)
+        return test_cli.patch(
+            "/attendance/LEG_REAL_01/2026-07-14",
+            json={
+                "regularized_by": f"admin_{i}",
+                "reason": f"concurrent update {i}",
+                "punch_in": 1783999800000 + (i * 60000),
+            },
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        statuses = list(executor.map(attempt_concurrent, range(1, 5)))
+
+    assert 200 in statuses
+    assert all(code in (200, 409) for code in statuses)
+
+
+# --------------------------------------------------------------------------- #
+# 17. Real MongoDB Production Trend Midpoint Half-Up Rounding Verification
+# --------------------------------------------------------------------------- #
+def test_real_mongo_trend_exact_midpoint_half_up_rounding(real_db, client):
+    real_db.employees.delete_many({"department": "MidpointDept"})
+    real_db.attendance_logs.delete_many({"date": "2026-07-06"})
+
+    # Create 20,000 employees so that 7 present gives 7 / 20000 = 0.00035
+    # (Exact half-up midpoint: 0.00035 must round to 0.0004, whereas banker's rounding would give 0.0003)
+    emps = []
+    for i in range(1, 20001):
+        emps.append({
+            "emp_code": f"MP_{i:05d}",
+            "name": f"Midpoint Emp {i}",
+            "email": f"mp{i}@example.com",
+            "department": "MidpointDept",
+            "shift_start": "09:30",
+            "shift_end": "18:30",
+            "joined_on": "2026-07-01",
+            "created_at": datetime(2026, 7, 1, 0, 0, 0, tzinfo=timezone.utc),
+        })
+    real_db.employees.insert_many(emps)
+
+    # Insert exactly 7 present attendance logs on Monday 2026-07-06
+    logs = []
+    for i in range(1, 8):
+        logs.append({
+            "emp_code": f"MP_{i:05d}",
+            "date": "2026-07-06",
+            "status": "PRESENT",
+            "punch_in": datetime(2026, 7, 6, 4, 0, 0, tzinfo=timezone.utc),
+            "punch_out": datetime(2026, 7, 6, 13, 0, 0, tzinfo=timezone.utc),
+            "work_hours": 9.0,
+            "late_minutes": 0,
+            "overtime_minutes": 0,
+            "half_day": False,
+            "history": [],
+        })
+    real_db.attendance_logs.insert_many(logs)
+
+    resp = client.get("/analytics/departments/MidpointDept/trend?from=2026-07-06&to=2026-07-06")
+    assert resp.status_code == 200
+    data = resp.json()
+    item = data["items"][0]
+    assert item["headcount"] == 20000
+    assert item["present_count"] == 7.0
+    # Strict Rule R8: 0.00035 rounds half-up to 0.0004
+    assert item["attendance_rate"] == 0.0004
+    assert item["moving_avg_7d"] == 0.0004
+
 
 

@@ -507,3 +507,45 @@ def test_legacy_record_serialization_defaults():
     assert serialized["late_minutes"] == 0
     assert serialized["overtime_minutes"] == 0
     assert serialized["work_hours"] is None
+
+
+def test_regularize_legacy_missing_history_and_half_day(client, mock_db):
+    mock_db.employees.insert_one({
+        "emp_code": "LEG001",
+        "name": "Legacy Worker",
+        "email": "legacy@example.com",
+        "department": "Engineering",
+        "shift_start": "09:30",
+        "shift_end": "18:30",
+        "joined_on": "2026-01-01",
+    })
+    mock_db.attendance_logs.insert_one({
+        "emp_code": "LEG001",
+        "date": "2026-07-14",
+        "status": "PRESENT",
+        "punch_in": datetime(2026, 7, 14, 4, 2, 0, tzinfo=timezone.utc),
+        "punch_out": datetime(2026, 7, 14, 13, 1, 0, tzinfo=timezone.utc),
+        "work_hours": 8.98,
+        "late_minutes": 0,
+        "overtime_minutes": 0,
+    })
+
+    new_punch_in_ms = int(datetime(2026, 7, 14, 3, 58, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    resp = client.patch(
+        "/attendance/LEG001/2026-07-14",
+        json={
+            "regularized_by": "hr.admin",
+            "reason": "biometric sync",
+            "punch_in": new_punch_in_ms,
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["emp_code"] == "LEG001"
+    assert len(data["history"]) == 1
+    h0 = data["history"][0]
+    assert h0["by"] == "hr.admin"
+    assert h0["reason"] == "biometric sync"
+    assert "half_day" not in h0["changes"]
+    assert "punch_in" in h0["changes"]
+

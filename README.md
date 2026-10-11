@@ -77,11 +77,11 @@ pytest tests/test_analytics.py tests/test_concurrency.py tests/test_foundations.
 ```
 
 ### 4.2 Integration Tests (Real MongoDB 6.0+)
-These tests execute directly against a live MongoDB 6.0+ instance (pointing to the dedicated `hrone_attendance_test` database specified in `.env`):
+These tests execute directly against a live MongoDB 6.0+ instance (respecting `MONGO_URI` and `MONGO_DB` configured in the environment):
 ```bash
 pytest tests/test_real_mongodb_integration.py -v
 ```
-Verifies server version (&ge; 6.0), startup index creation, production aggregation pipelines, transaction/race-safe concurrency, and `/admin/explain/{endpoint}` plan outputs.
+Verifies server version (&ge; 6.0), startup index creation, production aggregation pipelines, transaction/race-safe concurrency, legacy record regularization, strict half-up rounding at exact midpoints, and `/admin/explain/{endpoint}` plan outputs.
 
 ### 4.3 Full Test Suite
 To run the full suite (unit + real integration tests):
