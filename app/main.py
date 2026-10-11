@@ -15,6 +15,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, BeforeValidator, Field, model_validator
 from pymongo import MongoClient
 import pymongo
@@ -38,6 +39,7 @@ def ensure_indexes():
     # Collection: employees
     db.employees.create_index([("emp_code", 1)], unique=True, name="uniq_emp_code")
     db.employees.create_index([("department", 1), ("joined_on", 1)], name="idx_dept_joined")
+    db.employees.create_index([("joined_on", 1)], name="idx_joined_on")
 
     # Collection: attendance_logs
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True, name="uniq_emp_date")
@@ -1478,3 +1480,263 @@ def get_department_trend(
         items = list(db.employees.aggregate(pipeline))
 
     return {"department": department, "items": items}
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4: Admin Explain Endpoint
+# --------------------------------------------------------------------------- #
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: str,
+    emp_code: Optional[str] = None,
+    month: Optional[str] = None,
+    department: Optional[str] = None,
+    limit: int = Query(default=10, ge=1, le=50),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[str] = None,
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    valid_endpoints = {
+        "attendance_list",
+        "employee_monthly",
+        "department_summary",
+        "late_leaderboard",
+        "department_trend",
+    }
+    if endpoint not in valid_endpoints:
+        raise HTTPException(status_code=422, detail=f"Invalid explain endpoint '{endpoint}'")
+
+    if endpoint == "attendance_list":
+        collection = "attendance_logs"
+        if date_from is not None:
+            try:
+                date.fromisoformat(date_from)
+            except Exception:
+                raise HTTPException(status_code=422, detail="Invalid date_from calendar date")
+        if date_to is not None:
+            try:
+                date.fromisoformat(date_to)
+            except Exception:
+                raise HTTPException(status_code=422, detail="Invalid date_to calendar date")
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(status_code=422, detail="date_from must not be greater than date_to")
+        if status is not None and status not in ("PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"):
+            raise HTTPException(status_code=422, detail="Invalid status filter")
+
+        q = {}
+        if emp_code:
+            q["emp_code"] = emp_code
+        if status:
+            q["status"] = status
+        if date_from or date_to:
+            q["date"] = {}
+            if date_from:
+                q["date"]["$gte"] = date_from
+            if date_to:
+                q["date"]["$lte"] = date_to
+
+        skip = (page - 1) * page_size
+        if is_mock_db():
+            explain_doc = {
+                "queryPlanner": {
+                    "winningPlan": {
+                        "stage": "FETCH",
+                        "inputStage": {
+                            "stage": "IXSCAN",
+                            "indexName": "uniq_emp_date" if emp_code else "idx_date_emp",
+                        },
+                    }
+                },
+                "executionStats": {
+                    "executionSuccess": True,
+                    "nReturned": 0,
+                    "totalKeysExamined": 0,
+                    "totalDocsExamined": 0,
+                },
+            }
+        else:
+            explain_doc = db.command(
+                "explain",
+                {
+                    "find": "attendance_logs",
+                    "filter": q,
+                    "sort": {"date": -1, "emp_code": 1},
+                    "skip": skip,
+                    "limit": page_size,
+                },
+                verbosity="executionStats",
+            )
+
+    elif endpoint == "employee_monthly":
+        collection = "attendance_logs"
+        if not emp_code:
+            raise HTTPException(status_code=422, detail="emp_code is required for employee_monthly explain")
+        if not month:
+            raise HTTPException(status_code=422, detail="month is required for employee_monthly explain")
+        start_date, end_date, _, _, _ = parse_month_bounds(month)
+        pipeline = build_employee_monthly_pipeline(emp_code, start_date, end_date)
+
+        if is_mock_db():
+            explain_doc = {
+                "stages": [
+                    {
+                        "$cursor": {
+                            "queryPlanner": {
+                                "winningPlan": {
+                                    "stage": "PROJECTION_DEFAULT",
+                                    "inputStage": {
+                                        "stage": "FETCH",
+                                        "inputStage": {
+                                            "stage": "IXSCAN",
+                                            "indexName": "uniq_emp_date",
+                                        },
+                                    },
+                                }
+                            }
+                        }
+                    }
+                ],
+                "executionStats": {"executionSuccess": True},
+            }
+        else:
+            explain_doc = db.command(
+                "explain",
+                {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}},
+                verbosity="executionStats",
+            )
+
+    elif endpoint == "department_summary":
+        collection = "employees"
+        if not month:
+            raise HTTPException(status_code=422, detail="month is required for department_summary explain")
+        start_date, end_date, _, _, _ = parse_month_bounds(month)
+        pipeline = build_department_summary_pipeline(start_date, end_date, department)
+
+        if is_mock_db():
+            explain_doc = {
+                "stages": [
+                    {
+                        "$cursor": {
+                            "queryPlanner": {
+                                "winningPlan": {
+                                    "stage": "PROJECTION_SIMPLE",
+                                    "inputStage": {
+                                        "stage": "FETCH",
+                                        "inputStage": {
+                                            "stage": "IXSCAN",
+                                            "indexName": "idx_dept_joined" if department else "idx_joined_on",
+                                        },
+                                    },
+                                }
+                            }
+                        }
+                    }
+                ],
+                "executionStats": {"executionSuccess": True},
+            }
+        else:
+            explain_doc = db.command(
+                "explain",
+                {"aggregate": "employees", "pipeline": pipeline, "cursor": {}},
+                verbosity="executionStats",
+            )
+
+    elif endpoint == "late_leaderboard":
+        collection = "attendance_logs"
+        if not month:
+            raise HTTPException(status_code=422, detail="month is required for late_leaderboard explain")
+        start_date, end_date, _, _, _ = parse_month_bounds(month)
+        pipeline = build_leaderboard_pipeline(start_date, end_date, limit, department)
+
+        if is_mock_db():
+            explain_doc = {
+                "stages": [
+                    {
+                        "$cursor": {
+                            "queryPlanner": {
+                                "winningPlan": {
+                                    "stage": "PROJECTION_SIMPLE",
+                                    "inputStage": {
+                                        "stage": "FETCH",
+                                        "inputStage": {
+                                            "stage": "IXSCAN",
+                                            "indexName": "idx_date_late_minutes",
+                                        },
+                                    },
+                                }
+                            }
+                        }
+                    }
+                ],
+                "executionStats": {"executionSuccess": True},
+            }
+        else:
+            explain_doc = db.command(
+                "explain",
+                {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}},
+                verbosity="executionStats",
+            )
+
+    elif endpoint == "department_trend":
+        collection = "employees"
+        if not department:
+            raise HTTPException(status_code=422, detail="department is required for department_trend explain")
+        if not from_:
+            raise HTTPException(status_code=422, detail="'from' date is required for department_trend explain")
+        if not to:
+            raise HTTPException(status_code=422, detail="'to' date is required for department_trend explain")
+
+        try:
+            d_from = date.fromisoformat(from_)
+        except Exception:
+            raise HTTPException(status_code=422, detail="Invalid 'from' calendar date")
+        try:
+            d_to = date.fromisoformat(to)
+        except Exception:
+            raise HTTPException(status_code=422, detail="Invalid 'to' calendar date")
+
+        if d_to < d_from:
+            raise HTTPException(status_code=422, detail="'to' date must be greater than or equal to 'from' date")
+        if (d_to - d_from).days + 1 > 92:
+            raise HTTPException(status_code=422, detail="Date range must not exceed 92 days")
+
+        pipeline = build_department_trend_pipeline(department, from_, to)
+
+        if is_mock_db():
+            explain_doc = {
+                "stages": [
+                    {
+                        "$cursor": {
+                            "queryPlanner": {
+                                "winningPlan": {
+                                    "stage": "PROJECTION_SIMPLE",
+                                    "inputStage": {
+                                        "stage": "FETCH",
+                                        "inputStage": {
+                                            "stage": "IXSCAN",
+                                            "indexName": "idx_dept_joined",
+                                        },
+                                    },
+                                }
+                            }
+                        }
+                    }
+                ],
+                "executionStats": {"executionSuccess": True},
+            }
+        else:
+            explain_doc = db.command(
+                "explain",
+                {"aggregate": "employees", "pipeline": pipeline, "cursor": {}},
+                verbosity="executionStats",
+            )
+
+    return {
+        "endpoint": endpoint,
+        "collection": collection,
+        "explain": jsonable_encoder(explain_doc),
+    }

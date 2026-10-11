@@ -89,6 +89,9 @@ def test_real_mongo_server_version_and_indexes(real_mongo_client, real_db):
     assert emp_indexes["uniq_emp_code"]["key"] == [("emp_code", 1)]
     assert "idx_dept_joined" in emp_indexes
     assert emp_indexes["idx_dept_joined"]["key"] == [("department", 1), ("joined_on", 1)]
+    assert "idx_joined_on" in emp_indexes
+    assert emp_indexes["idx_joined_on"]["key"] == [("joined_on", 1)]
+
 
     # Verify attendance_logs indexes on real MongoDB
     att_indexes = real_db.attendance_logs.index_information()
@@ -584,4 +587,95 @@ def test_real_mongo_list_attendance_date_boundaries_and_sorting(client, real_db)
     assert items[0]["date"] == "2026-07-03"
     assert items[1]["date"] == "2026-07-02"
     assert items[2]["date"] == "2026-07-01"
+
+
+# --------------------------------------------------------------------------- #
+# 5. Real MongoDB /admin/explain/{endpoint} Verification
+# --------------------------------------------------------------------------- #
+def test_real_mongo_admin_explain_all_five_endpoints(client, real_db):
+    # Seed representative records so query planner evaluates indexes
+    real_db.employees.insert_many([
+        {
+            "emp_code": f"EXP{i:04d}",
+            "name": f"Explain User {i}",
+            "department": "Engineering" if i % 2 == 0 else "Sales",
+            "joined_on": "2026-01-01",
+        }
+        for i in range(50)
+    ])
+    real_db.attendance_logs.insert_many([
+        {
+            "emp_code": f"EXP{i:04d}",
+            "date": "2026-07-06",
+            "status": "PRESENT",
+            "late_minutes": 15,
+            "work_hours": 8.0,
+            "half_day": False,
+        }
+        for i in range(50)
+    ])
+
+    def has_stage(plan, target_stage):
+        if isinstance(plan, dict):
+            if plan.get("stage") == target_stage:
+                return True
+            return any(has_stage(v, target_stage) for v in plan.values())
+        elif isinstance(plan, list):
+            return any(has_stage(item, target_stage) for item in plan)
+        return False
+
+    # 1. attendance_list
+    res1 = client.get("/admin/explain/attendance_list?emp_code=EXP0001&date_from=2026-07-01&date_to=2026-07-31")
+    assert res1.status_code == 200
+    d1 = res1.json()
+    assert d1["endpoint"] == "attendance_list"
+    assert d1["collection"] == "attendance_logs"
+    assert "executionStats" in d1["explain"]
+    assert has_stage(d1["explain"], "IXSCAN")
+    assert not has_stage(d1["explain"].get("queryPlanner", {}).get("winningPlan", {}), "COLLSCAN")
+
+    # 2. employee_monthly
+    res2 = client.get("/admin/explain/employee_monthly?emp_code=EXP0001&month=2026-07")
+    assert res2.status_code == 200
+    d2 = res2.json()
+    assert d2["endpoint"] == "employee_monthly"
+    assert d2["collection"] == "attendance_logs"
+    assert "stages" in d2["explain"]
+    cursor_stage2 = d2["explain"]["stages"][0].get("$cursor", {})
+    assert has_stage(cursor_stage2, "IXSCAN")
+    assert not has_stage(cursor_stage2.get("queryPlanner", {}).get("winningPlan", {}), "COLLSCAN")
+
+    # 3. department_summary
+    res3 = client.get("/admin/explain/department_summary?month=2026-07&department=Engineering")
+    assert res3.status_code == 200
+    d3 = res3.json()
+    assert d3["endpoint"] == "department_summary"
+    assert d3["collection"] == "employees"
+    assert "stages" in d3["explain"]
+    cursor_stage3 = d3["explain"]["stages"][0].get("$cursor", {})
+    assert has_stage(cursor_stage3, "IXSCAN")
+    assert not has_stage(cursor_stage3.get("queryPlanner", {}).get("winningPlan", {}), "COLLSCAN")
+
+    # 4. late_leaderboard
+    res4 = client.get("/admin/explain/late_leaderboard?month=2026-07&limit=10&department=Engineering")
+    assert res4.status_code == 200
+    d4 = res4.json()
+    assert d4["endpoint"] == "late_leaderboard"
+    assert d4["collection"] == "attendance_logs"
+    assert "stages" in d4["explain"]
+    cursor_stage4 = d4["explain"]["stages"][0].get("$cursor", {})
+    assert has_stage(cursor_stage4, "IXSCAN")
+    assert not has_stage(cursor_stage4.get("queryPlanner", {}).get("winningPlan", {}), "COLLSCAN")
+
+    # 5. department_trend
+    res5 = client.get("/admin/explain/department_trend?department=Engineering&from=2026-07-01&to=2026-07-05")
+    assert res5.status_code == 200
+    d5 = res5.json()
+    assert d5["endpoint"] == "department_trend"
+    assert d5["collection"] == "employees"
+    assert "stages" in d5["explain"]
+    cursor_stage5 = d5["explain"]["stages"][0].get("$cursor", {})
+    assert has_stage(cursor_stage5, "IXSCAN")
+    assert not has_stage(cursor_stage5.get("queryPlanner", {}).get("winningPlan", {}), "COLLSCAN")
+
 
