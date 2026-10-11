@@ -4,6 +4,8 @@
 
 2. **Punch-in race.** Two identical punch-in requests arrive simultaneously. Both locate the employee and compute the same IST attendance date. Both attempt `insert_one`. MongoDB's unique compound index on `(emp_code, date)` grants write lock to the first operation, returning 201. The concurrent request violates the unique constraint, raising `pymongo.errors.DuplicateKeyError`. Our endpoint catches this specific exception and returns HTTP 409 Conflict without race conditions or check-then-insert flaws.
 
-3. **Ties.** Two employees are tied on late minutes at the cutoff of `limit`. What does your leaderboard return, and why?
-4. **Headcount.** How does your department summary make sure employees with zero logs are counted?
-5. **One thing you would change** if this had to serve 100x the data.
+3. **Ties.** The leaderboard returns both tied employees, resulting in more than `limit` rows. We compute standard competition ranking (`1, 2, 2, 4`) using MongoDB's `$setWindowFields` with `$rank` ordered by `total_late_minutes` descending. Ranks are determined strictly by late minutes. Filtering `rank <= limit` occurs after ranking, including all tied employees at the cutoff. Secondary sorting by `emp_code` ascending ensures deterministic presentation order without breaking rank equality.
+
+4. **Headcount.** The pipeline roots in `employees` rather than `attendance_logs`. It filters employees with `joined_on <= month_end` and groups them by department to compute headcount directly via `{$sum: 1}`. It then joins attendance records using `$lookup`. Departments and employees with zero attendance records retain their full headcount, returning 0 present days and `null` average work hours rather than vanishing from the summary.
+
+5. **One thing you would change.** To handle 100x the data (~10M+ attendance logs), we would maintain pre-aggregated daily department summaries and employee monthly rollups via write-time triggers or Change Streams. Read-heavy analytics would query bounded rollup collections in single-digit milliseconds with simple indexed lookups, completely avoiding expensive full-collection multi-stage `$lookup` and `$group` aggregations over millions of raw documents.
