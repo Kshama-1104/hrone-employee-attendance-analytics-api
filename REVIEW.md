@@ -18,3 +18,13 @@ List every defect you found in the starter `app/main.py` (helpers and endpoints)
 ### Examined and Decided NOT to be Defects
 - Default shift times (`09:30` and `18:30`): Kept as defaults in `EmployeeCreate` because `openapi.yaml` explicitly documents them as default values.
 - `emp_code` immutable customer code: Verified that the absence of an update endpoint for `emp_code` is intentional per the problem statement convention.
+
+---
+
+## Phase 3.1 Adversarial Audit Remediations
+
+| # | Where (function / component) | What was wrong / Risk identified | How noticed | Remediation |
+|---|---|---|---|---|
+| A1 | Analytics handlers (`app/main.py`) | Handlers caught `(NotImplementedError, OperationFailure)` broadly, which silently swallowed real production MongoDB errors and fell back to Python loops. | Adversarial audit of exception handling paths. | Replaced broad catches with `is_mock_db()` guard. In production environments (`mongomock` not active), MongoDB errors are raised strictly without swallowing. |
+| A2 | `build_department_trend_pipeline` | Trend endpoint previously raised `NotImplementedError` directly, bypassing the production aggregation pipeline. | Inspection of `get_department_trend`. | Implemented 100% database-side aggregation pipeline using `$map`, `$range`, `$dateAdd`, `$lookup`, and `$setWindowFields` for real MongoDB 5.0/6.0+. |
+

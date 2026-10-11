@@ -2,6 +2,7 @@ import calendar
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 import mongomock
+import pymongo
 import pytest
 from fastapi.testclient import TestClient
 
@@ -539,3 +540,119 @@ def test_department_trend_daily_metrics_and_moving_average(client, mock_db):
     assert items[5]["present_count"] == 2.0
     assert items[5]["attendance_rate"] == 1.0
     assert items[5]["moving_avg_7d"] == 0.6875
+
+
+def test_employee_monthly_legacy_missing_fields(client, mock_db):
+    # Legacy record in attendance_logs omitting half_day, late_minutes, overtime_minutes
+    mock_db.employees.insert_one({
+        "emp_code": "EMP0010",
+        "name": "Legacy Emp",
+        "email": "legacy@example.com",
+        "department": "Support",
+        "shift_start": "09:30",
+        "shift_end": "18:30",
+        "joined_on": "2026-01-01",
+    })
+    # Omitted half_day -> defaults to false (1.0 present day); omitted late/overtime -> 0
+    mock_db.attendance_logs.insert_one({
+        "emp_code": "EMP0010",
+        "date": "2026-07-06",
+        "status": "PRESENT",
+        "work_hours": 8.0,
+    })
+
+    res = client.get("/analytics/employees/EMP0010/monthly?month=2026-07")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["present_days"] == 1.0
+    assert data["late_count"] == 0
+    assert data["total_late_minutes"] == 0
+    assert data["total_overtime_minutes"] == 0
+
+
+def test_department_summary_zero_qualifying_work_hour_records(client, mock_db):
+    # Department where records have presence status, but work_hours is null (unclosed punch-ins)
+    mock_db.employees.insert_one({
+        "emp_code": "EMP0020",
+        "name": "No Hours",
+        "department": "Security",
+        "joined_on": "2026-01-01",
+    })
+    mock_db.attendance_logs.insert_one({
+        "emp_code": "EMP0020",
+        "date": "2026-07-06",
+        "status": "PRESENT",
+        "work_hours": None,
+        "late_minutes": 0,
+    })
+
+    res = client.get("/analytics/departments/summary?month=2026-07&department=Security")
+    assert res.status_code == 200
+    items = res.json()["items"]
+    assert len(items) == 1
+    sec = items[0]
+    assert sec["headcount"] == 1
+    assert sec["present_days"] == 1.0
+    # Must be null, not 0.0 or error
+    assert sec["avg_work_hours"] is None
+
+
+def test_department_trend_no_logs_and_weekend_start(client, mock_db):
+    # Department with employees, but requested range starts on Saturday and has ZERO logs
+    mock_db.employees.insert_one({
+        "emp_code": "EMP0030",
+        "name": "Weekend Start",
+        "department": "Operations",
+        "joined_on": "2026-01-01",
+    })
+
+    # Range: 2026-07-04 (Sat) to 2026-07-06 (Mon)
+    res = client.get("/analytics/departments/Operations/trend?from=2026-07-04&to=2026-07-06")
+    assert res.status_code == 200
+    items = res.json()["items"]
+    assert len(items) == 3
+
+    # Saturday: weekend, attendance_rate=None, moving_avg_7d=None
+    assert items[0]["date"] == "2026-07-04"
+    assert items[0]["is_working_day"] is False
+    assert items[0]["attendance_rate"] is None
+    assert items[0]["moving_avg_7d"] is None
+
+    # Sunday: weekend, attendance_rate=None, moving_avg_7d=None
+    assert items[1]["date"] == "2026-07-05"
+    assert items[1]["is_working_day"] is False
+    assert items[1]["attendance_rate"] is None
+    assert items[1]["moving_avg_7d"] is None
+
+    # Monday: working day with 0 logs -> rate=0.0, moving_avg_7d=0.0
+    assert items[2]["date"] == "2026-07-06"
+    assert items[2]["is_working_day"] is True
+    assert items[2]["headcount"] == 1
+    assert items[2]["present_count"] == 0.0
+    assert items[2]["attendance_rate"] == 0.0
+    assert items[2]["moving_avg_7d"] == 0.0
+
+
+def test_strict_production_mode_does_not_swallow_errors(client, mock_db, monkeypatch):
+    mock_db.employees.insert_one({
+        "emp_code": "EMP0001",
+        "name": "Prod Emp",
+        "email": "prod@example.com",
+        "department": "Engineering",
+        "shift_start": "09:30",
+        "shift_end": "18:30",
+        "joined_on": "2026-01-01",
+    })
+
+    # Simulate production mode where is_mock_db() returns False
+    monkeypatch.setattr(app_module, "is_mock_db", lambda: False)
+
+    # In production mode, an operation error on attendance_logs must raise, NOT fall back silently
+    def failing_aggregate(*args, **kwargs):
+        raise pymongo.errors.OperationFailure("Simulated production database error")
+
+    monkeypatch.setattr(mock_db.attendance_logs, "aggregate", failing_aggregate)
+
+    with pytest.raises(pymongo.errors.OperationFailure):
+        client.get("/analytics/employees/EMP0001/monthly?month=2026-07")
+
