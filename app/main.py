@@ -34,25 +34,26 @@ logger = logging.getLogger("uvicorn.error")
 
 def ensure_indexes():
     """Idempotently create required indexes across collections."""
-    try:
-        # Collection: employees
-        db.employees.create_index([("emp_code", 1)], unique=True, name="uniq_emp_code")
-        db.employees.create_index([("department", 1), ("joined_on", 1)], name="idx_dept_joined")
+    # Collection: employees
+    db.employees.create_index([("emp_code", 1)], unique=True, name="uniq_emp_code")
+    db.employees.create_index([("department", 1), ("joined_on", 1)], name="idx_dept_joined")
 
-        # Collection: attendance_logs
-        db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True, name="uniq_emp_date")
-        db.attendance_logs.create_index([("date", -1), ("emp_code", 1)], name="idx_date_emp")
-        db.attendance_logs.create_index([("emp_code", 1), ("date", 1), ("status", 1)], name="idx_emp_date_status")
-        db.attendance_logs.create_index([("date", 1), ("status", 1)], name="idx_date_status")
-        db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)], name="idx_emp_punch_in")
-        logger.info("MongoDB indexes verified successfully.")
-    except Exception as exc:
-        logger.warning(f"Could not initialize MongoDB indexes at startup: {exc}")
+    # Collection: attendance_logs
+    db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True, name="uniq_emp_date")
+    db.attendance_logs.create_index([("date", -1), ("emp_code", 1)], name="idx_date_emp")
+    db.attendance_logs.create_index([("emp_code", 1), ("date", 1), ("status", 1)], name="idx_emp_date_status")
+    db.attendance_logs.create_index([("date", 1), ("status", 1)], name="idx_date_status")
+    db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)], name="idx_emp_punch_in")
+    logger.info("MongoDB indexes verified successfully.")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    ensure_indexes()
+    try:
+        ensure_indexes()
+    except Exception as exc:
+        logger.error(f"Failed to initialize required MongoDB indexes at startup: {exc}")
+        raise RuntimeError(f"Database initialization failed: {exc}") from exc
     yield
 
 
@@ -207,6 +208,17 @@ def serialize_attendance_record(doc: dict) -> dict:
             rec[field] = dt_to_epoch_ms(val)
         else:
             rec[field] = None
+
+    if "work_hours" not in rec:
+        rec["work_hours"] = None
+    if rec.get("late_minutes") is None:
+        rec["late_minutes"] = 0
+    if rec.get("overtime_minutes") is None:
+        rec["overtime_minutes"] = 0
+    if rec.get("half_day") is None:
+        rec["half_day"] = False
+    if rec.get("history") is None:
+        rec["history"] = []
 
     history = []
     for h in rec.get("history", []):
@@ -434,6 +446,18 @@ def list_attendance(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ):
+    if date_from is not None:
+        try:
+            date.fromisoformat(date_from)
+        except Exception:
+            raise HTTPException(status_code=422, detail="Invalid date_from calendar date")
+
+    if date_to is not None:
+        try:
+            date.fromisoformat(date_to)
+        except Exception:
+            raise HTTPException(status_code=422, detail="Invalid date_to calendar date")
+
     if date_from and date_to:
         if date_from > date_to:
             raise HTTPException(status_code=422, detail="date_from must not be greater than date_to")
@@ -460,6 +484,12 @@ def list_attendance(
 
 @app.patch("/attendance/{emp_code}/{date}")
 def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
+    try:
+        from datetime import date as date_cls
+        date_cls.fromisoformat(date)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid date path parameter")
+
     emp = db.employees.find_one({"emp_code": emp_code})
     if not emp:
         raise HTTPException(status_code=404, detail="Unknown employee")

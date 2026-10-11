@@ -447,3 +447,63 @@ def test_regularize_no_change_422(client):
         },
     )
     assert resp.status_code == 422
+
+
+def test_invalid_calendar_dates(client):
+    client.post("/employees", json={
+        "emp_code": "EMP0001",
+        "name": "Asha",
+        "email": "asha@example.com",
+        "department": "Eng",
+        "joined_on": "2026-01-01",
+    })
+
+    # Invalid calendar date strings in GET /attendance
+    assert client.get("/attendance?date_from=2026-02-31").status_code == 422
+    assert client.get("/attendance?date_to=invalid-date").status_code == 422
+
+    # Invalid date path parameter in PATCH /attendance/{emp_code}/{date}
+    assert client.patch(
+        "/attendance/EMP0001/2026-13-45",
+        json={"reason": "test fix", "regularized_by": "admin", "status": "PRESENT"}
+    ).status_code == 422
+
+
+def test_epoch_millis_range_boundaries(client):
+    client.post("/employees", json={
+        "emp_code": "EMP0001",
+        "name": "Asha",
+        "email": "asha@example.com",
+        "department": "Eng",
+        "joined_on": "2026-01-01",
+    })
+
+    # Min allowed: 100000000000 (valid)
+    resp_min = client.post("/attendance/punch-in", json={"emp_code": "EMP0001", "punched_at": 100000000000})
+    assert resp_min.status_code in (201, 409)
+
+    # Below min: 99999999999 -> 422
+    resp_below = client.post("/attendance/punch-in", json={"emp_code": "EMP0001", "punched_at": 99999999999})
+    assert resp_below.status_code == 422
+
+    # Above max: 4102444800001 -> 422
+    resp_above = client.post("/attendance/punch-in", json={"emp_code": "EMP0001", "punched_at": 4102444800001})
+    assert resp_above.status_code == 422
+
+
+def test_legacy_record_serialization_defaults():
+    from app.main import serialize_attendance_record
+    legacy_doc = {
+        "emp_code": "EMP0002",
+        "date": "2026-07-14",
+        "status": "PRESENT",
+        "punch_in": datetime(2026, 7, 14, 4, 2, 0, tzinfo=timezone.utc),
+        "punch_out": datetime(2026, 7, 14, 13, 1, 0, tzinfo=timezone.utc),
+        # Notice missing half_day, history, late_minutes, overtime_minutes
+    }
+    serialized = serialize_attendance_record(legacy_doc)
+    assert serialized["half_day"] is False
+    assert serialized["history"] == []
+    assert serialized["late_minutes"] == 0
+    assert serialized["overtime_minutes"] == 0
+    assert serialized["work_hours"] is None

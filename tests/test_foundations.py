@@ -5,7 +5,7 @@ from app.main import app, ensure_indexes
 
 
 def test_health_check_success():
-    with patch("app.main.db.command", return_value={"ok": 1}):
+    with patch("app.main.ensure_indexes"), patch("app.main.db.command", return_value={"ok": 1}):
         with TestClient(app) as client:
             response = client.get("/health")
             assert response.status_code == 200
@@ -13,7 +13,7 @@ def test_health_check_success():
 
 
 def test_health_check_failure():
-    with patch("app.main.db.command", side_effect=Exception("Connection refused")):
+    with patch("app.main.ensure_indexes"), patch("app.main.db.command", side_effect=Exception("Connection refused")):
         with TestClient(app) as client:
             response = client.get("/health")
             assert response.status_code == 503
@@ -47,3 +47,11 @@ def test_ensure_indexes_creates_expected_indexes():
         # Verify (emp_code, date) unique constraint
         uniq_att_call = [call for call in att_calls if call[0][0] == [("emp_code", 1), ("date", 1)]][0]
         assert uniq_att_call[1].get("unique") is True
+
+
+def test_lifespan_startup_fails_when_index_creation_fails():
+    with patch("app.main.ensure_indexes", side_effect=Exception("Disk full / index failure")):
+        with pytest.raises(RuntimeError) as exc_info:
+            with TestClient(app):
+                pass
+        assert "Database initialization failed" in str(exc_info.value)
