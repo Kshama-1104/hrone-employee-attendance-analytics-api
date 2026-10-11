@@ -28,3 +28,12 @@ List every defect you found in the starter `app/main.py` (helpers and endpoints)
 | A1 | Analytics handlers (`app/main.py`) | Handlers caught `(NotImplementedError, OperationFailure)` broadly, which silently swallowed real production MongoDB errors and fell back to Python loops. | Adversarial audit of exception handling paths. | Replaced broad catches with `is_mock_db()` guard. In production environments (`mongomock` not active), MongoDB errors are raised strictly without swallowing. |
 | A2 | `build_department_trend_pipeline` | Trend endpoint previously raised `NotImplementedError` directly, bypassing the production aggregation pipeline. | Inspection of `get_department_trend`. | Implemented 100% database-side aggregation pipeline using `$map`, `$range`, `$dateAdd`, `$lookup`, and `$setWindowFields` for real MongoDB 5.0/6.0+. |
 
+---
+
+## Phase 4 Admin Explain & Index Optimizations
+
+| # | Where (function / component) | What was wrong / Risk identified | How noticed | Remediation |
+|---|---|---|---|---|
+| B1 | `ensure_indexes` / `department_summary` | When `department_summary` is requested without an optional `department` parameter, the `$match` on `joined_on <= month_end` triggered a `COLLSCAN` on `employees`. | Query planner explain plan audit on live MongoDB 6.0. | Added single-field index `idx_joined_on` (`[("joined_on", 1)]`) on `employees`. Verified that `department_summary` without `department` now uses `IXSCAN`. |
+| B2 | `/admin/explain/{endpoint}` | Missing endpoint required by API specification to inspect production query execution statistics. | OpenAPI 3.0.3 contract audit. | Implemented route executing `explain("executionStats")` for all 5 endpoint keys using production query builders and jsonable serialization. |
+
