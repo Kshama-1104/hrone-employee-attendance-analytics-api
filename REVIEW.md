@@ -48,4 +48,12 @@ List every defect you found in the starter `app/main.py` (helpers and endpoints)
 | C3 | `requirements.txt` & `pytest.ini` | Test dependencies (`mongomock`, `pytest`, `httpx`) missing from `requirements.txt`. Plain `pytest -v` failed out of the box with `ModuleNotFoundError: No module named 'app'`. | Clean clone installation verification. | Added test dependencies to `requirements.txt` and created root `pytest.ini` with `pythonpath = .`. |
 | C4 | `tests/test_real_mongodb_integration.py` | Integration test suite hardcoded requirement that `MONGO_DB == "hrone_attendance_test"`, breaking evaluation if grader injects custom test database name. | Integration test precondition audit. | Relaxed database name assertion to accept any valid non-system database injected via environment while guarding against system databases (`admin`, `config`, `local`). |
 
+---
+
+## Phase 6 Strict Calendar Date Validation
+
+| # | Where (function / component) | What was wrong / Risk identified | How noticed | Remediation |
+|---|---|---|---|---|
+| D1 | Date Validation (`app/main.py`) | Python 3.11 `date.fromisoformat` accepts non-standard ISO representations (compact `20260701`, week-date `2026-W27-3`) instead of strict `YYYY-MM-DD` calendar dates across attendance listing, regularization, department trend, and admin explain. | Strict date format compliance audit. | Implemented `CALENDAR_DATE_REGEX` and `parse_strict_date()` helper across all date-accepting endpoints, strictly enforcing `YYYY-MM-DD` and real calendar date validation, returning HTTP 422 for compact, week-date, impossible, and reversed date ranges. |
+
 

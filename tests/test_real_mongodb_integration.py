@@ -792,4 +792,50 @@ def test_real_mongo_trend_exact_midpoint_half_up_rounding(real_db, client):
     assert item["moving_avg_7d"] == 0.0004
 
 
+def test_real_mongo_strict_date_validation_and_range_ordering(client, real_db):
+    """Verify strict calendar date validation and range ordering against live MongoDB."""
+    real_db.employees.insert_one({
+        "emp_code": "EMP_DATE1",
+        "name": "Date Test",
+        "email": "date1@example.com",
+        "department": "QA",
+        "shift_start": "09:30",
+        "shift_end": "18:30",
+        "joined_on": "2026-01-01",
+        "created_at": datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+    })
+
+    # 1. GET /attendance
+    assert client.get("/attendance?date_from=20260701").status_code == 422
+    assert client.get("/attendance?date_to=2026-W27-3").status_code == 422
+    assert client.get("/attendance?date_from=2026-02-29").status_code == 422
+    assert client.get("/attendance?date_from=2026-07-10&date_to=2026-07-01").status_code == 422
+
+    # 2. PATCH /attendance/{emp_code}/{date}
+    assert client.patch(
+        "/attendance/EMP_DATE1/20260701",
+        json={"reason": "test format", "regularized_by": "admin", "status": "PRESENT"},
+    ).status_code == 422
+    assert client.patch(
+        "/attendance/EMP_DATE1/2026-W27-3",
+        json={"reason": "test format", "regularized_by": "admin", "status": "PRESENT"},
+    ).status_code == 422
+    assert client.patch(
+        "/attendance/EMP_DATE1/2026-02-30",
+        json={"reason": "test format", "regularized_by": "admin", "status": "PRESENT"},
+    ).status_code == 422
+
+    # 3. GET /analytics/departments/{department}/trend
+    assert client.get("/analytics/departments/QA/trend?from=20260701&to=2026-07-05").status_code == 422
+    assert client.get("/analytics/departments/QA/trend?from=2026-07-01&to=2026-W27-3").status_code == 422
+    assert client.get("/analytics/departments/QA/trend?from=2026-07-10&to=2026-07-01").status_code == 422
+
+    # 4. GET /admin/explain
+    assert client.get("/admin/explain/attendance_list?date_from=20260701").status_code == 422
+    assert client.get("/admin/explain/attendance_list?date_to=2026-W27-3").status_code == 422
+    assert client.get("/admin/explain/attendance_list?date_from=2026-07-10&date_to=2026-07-01").status_code == 422
+    assert client.get("/admin/explain/department_trend?department=QA&from=20260701&to=2026-07-05").status_code == 422
+    assert client.get("/admin/explain/department_trend?department=QA&from=2026-07-10&to=2026-07-01").status_code == 422
+
+
 

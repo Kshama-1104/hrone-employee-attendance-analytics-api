@@ -458,15 +458,61 @@ def test_invalid_calendar_dates(client):
         "joined_on": "2026-01-01",
     })
 
-    # Invalid calendar date strings in GET /attendance
+    # 1. GET /attendance date validation
+    # Impossible calendar dates
     assert client.get("/attendance?date_from=2026-02-31").status_code == 422
+    assert client.get("/attendance?date_from=2026-02-29").status_code == 422  # Non-leap year
+    assert client.get("/attendance?date_to=2026-04-31").status_code == 422
+    # Compact dates (YYYYMMDD) must be rejected
+    assert client.get("/attendance?date_from=20260701").status_code == 422
+    # Week-date format (YYYY-Www-D) must be rejected
+    assert client.get("/attendance?date_to=2026-W27-3").status_code == 422
+    # Malformed dates
+    assert client.get("/attendance?date_from=2026-7-1").status_code == 422
+    assert client.get("/attendance?date_to=2026/07/01").status_code == 422
     assert client.get("/attendance?date_to=invalid-date").status_code == 422
+    # Reversed date range
+    assert client.get("/attendance?date_from=2026-07-10&date_to=2026-07-01").status_code == 422
 
-    # Invalid date path parameter in PATCH /attendance/{emp_code}/{date}
+    # 2. PATCH /attendance/{emp_code}/{date} path parameter validation
     assert client.patch(
         "/attendance/EMP0001/2026-13-45",
         json={"reason": "test fix", "regularized_by": "admin", "status": "PRESENT"}
     ).status_code == 422
+    assert client.patch(
+        "/attendance/EMP0001/20260701",
+        json={"reason": "test fix", "regularized_by": "admin", "status": "PRESENT"}
+    ).status_code == 422
+    assert client.patch(
+        "/attendance/EMP0001/2026-W27-3",
+        json={"reason": "test fix", "regularized_by": "admin", "status": "PRESENT"}
+    ).status_code == 422
+    assert client.patch(
+        "/attendance/EMP0001/2026-02-30",
+        json={"reason": "test fix", "regularized_by": "admin", "status": "PRESENT"}
+    ).status_code == 422
+
+    # 3. GET /analytics/departments/{department}/trend date validation
+    # Impossible dates
+    assert client.get("/analytics/departments/Eng/trend?from=2026-02-29&to=2026-03-01").status_code == 422
+    assert client.get("/analytics/departments/Eng/trend?from=2026-07-01&to=2026-04-31").status_code == 422
+    # Compact & week-date formats
+    assert client.get("/analytics/departments/Eng/trend?from=20260701&to=2026-07-05").status_code == 422
+    assert client.get("/analytics/departments/Eng/trend?from=2026-07-01&to=2026-W27-3").status_code == 422
+    # Malformed
+    assert client.get("/analytics/departments/Eng/trend?from=bad&to=2026-07-05").status_code == 422
+    # Reversed range
+    assert client.get("/analytics/departments/Eng/trend?from=2026-07-10&to=2026-07-01").status_code == 422
+
+    # 4. GET /admin/explain date validation
+    # attendance_list
+    assert client.get("/admin/explain/attendance_list?date_from=20260701").status_code == 422
+    assert client.get("/admin/explain/attendance_list?date_to=2026-W27-3").status_code == 422
+    assert client.get("/admin/explain/attendance_list?date_from=2026-07-10&date_to=2026-07-01").status_code == 422
+    # department_trend
+    assert client.get("/admin/explain/department_trend?department=Eng&from=20260701&to=2026-07-05").status_code == 422
+    assert client.get("/admin/explain/department_trend?department=Eng&from=2026-07-01&to=2026-W27-3").status_code == 422
+    assert client.get("/admin/explain/department_trend?department=Eng&from=2026-07-10&to=2026-07-01").status_code == 422
 
 
 def test_epoch_millis_range_boundaries(client):

@@ -117,6 +117,19 @@ def ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
     return dt.astimezone(UTC)
 
 
+CALENDAR_DATE_REGEX = re.compile(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
+
+
+def parse_strict_date(val: str, field_name: str = "date") -> date:
+    """Validate strict YYYY-MM-DD format and actual calendar date."""
+    if not isinstance(val, str) or not CALENDAR_DATE_REGEX.match(val):
+        raise HTTPException(status_code=422, detail=f"Invalid {field_name} format, expected YYYY-MM-DD")
+    try:
+        return date.fromisoformat(val)
+    except Exception:
+        raise HTTPException(status_code=422, detail=f"Invalid {field_name} calendar date")
+
+
 def get_attendance_date(punch_in_utc: datetime, shift_start: str, shift_end: str) -> str:
     """
     R1: Time zone and attendance date.
@@ -450,20 +463,16 @@ def list_attendance(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ):
+    d_from = None
+    d_to = None
     if date_from is not None:
-        try:
-            date.fromisoformat(date_from)
-        except Exception:
-            raise HTTPException(status_code=422, detail="Invalid date_from calendar date")
+        d_from = parse_strict_date(date_from, "date_from")
 
     if date_to is not None:
-        try:
-            date.fromisoformat(date_to)
-        except Exception:
-            raise HTTPException(status_code=422, detail="Invalid date_to calendar date")
+        d_to = parse_strict_date(date_to, "date_to")
 
-    if date_from and date_to:
-        if date_from > date_to:
+    if d_from and d_to:
+        if d_from > d_to:
             raise HTTPException(status_code=422, detail="date_from must not be greater than date_to")
 
     q = {}
@@ -488,11 +497,7 @@ def list_attendance(
 
 @app.patch("/attendance/{emp_code}/{date}")
 def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
-    try:
-        from datetime import date as date_cls
-        date_cls.fromisoformat(date)
-    except Exception:
-        raise HTTPException(status_code=422, detail="Invalid date path parameter")
+    parse_strict_date(date, "date path parameter")
 
     emp = db.employees.find_one({"emp_code": emp_code})
     if not emp:
@@ -1426,15 +1431,8 @@ def get_department_trend(
     if not dept_emp:
         raise HTTPException(status_code=404, detail="Unknown department")
 
-    try:
-        d_from = date.fromisoformat(from_)
-    except Exception:
-        raise HTTPException(status_code=422, detail="Invalid 'from' calendar date")
-
-    try:
-        d_to = date.fromisoformat(to)
-    except Exception:
-        raise HTTPException(status_code=422, detail="Invalid 'to' calendar date")
+    d_from = parse_strict_date(from_, "'from'")
+    d_to = parse_strict_date(to, "'to'")
 
     if d_to < d_from:
         raise HTTPException(status_code=422, detail="'to' date must be greater than or equal to 'from' date")
@@ -1568,17 +1566,13 @@ def explain_endpoint(
 
     if endpoint == "attendance_list":
         collection = "attendance_logs"
+        d_from = None
+        d_to = None
         if date_from is not None:
-            try:
-                date.fromisoformat(date_from)
-            except Exception:
-                raise HTTPException(status_code=422, detail="Invalid date_from calendar date")
+            d_from = parse_strict_date(date_from, "date_from")
         if date_to is not None:
-            try:
-                date.fromisoformat(date_to)
-            except Exception:
-                raise HTTPException(status_code=422, detail="Invalid date_to calendar date")
-        if date_from and date_to and date_from > date_to:
+            d_to = parse_strict_date(date_to, "date_to")
+        if d_from and d_to and d_from > d_to:
             raise HTTPException(status_code=422, detail="date_from must not be greater than date_to")
         if status is not None and status not in ("PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"):
             raise HTTPException(status_code=422, detail="Invalid status filter")
@@ -1746,14 +1740,8 @@ def explain_endpoint(
         if not to:
             raise HTTPException(status_code=422, detail="'to' date is required for department_trend explain")
 
-        try:
-            d_from = date.fromisoformat(from_)
-        except Exception:
-            raise HTTPException(status_code=422, detail="Invalid 'from' calendar date")
-        try:
-            d_to = date.fromisoformat(to)
-        except Exception:
-            raise HTTPException(status_code=422, detail="Invalid 'to' calendar date")
+        d_from = parse_strict_date(from_, "'from'")
+        d_to = parse_strict_date(to, "'to'")
 
         if d_to < d_from:
             raise HTTPException(status_code=422, detail="'to' date must be greater than or equal to 'from' date")
