@@ -42,3 +42,11 @@ logs/
 
 # Local Database Artifacts
 mongo-data/
+
+# Candidate Kit Artifacts (Preserved locally, excluded from public submission repository)
+PROBLEM_STATEMENT.docx
+DATA_MODEL.md
+openapi.yaml
+sample_data/
+sample_seed.py
+IMPLEMENTATION_PLAN.md
