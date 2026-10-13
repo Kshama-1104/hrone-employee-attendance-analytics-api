@@ -8,4 +8,4 @@
 
 4. **Headcount.** Rooted in `employees` filtering `joined_on <= month_end`, joining logs via `$lookup`. Zero-log employees and departments retain full headcount, reporting 0 present days and `null` average hours.
 
-5. **100x Scale.** At 10M+ logs, in-memory grouping arrays risk MongoDB's 16MB document limit. We would maintain pre-aggregated daily summaries and monthly rollups via Change Streams, querying bounded rollups in single-digit milliseconds.
+5. **100x Scale.** At 10M+ logs, in-memory grouping arrays risk MongoDB's 16MB document limit. We would maintain pre-aggregated daily summaries and monthly rollups via Change Streams, allowing analytics endpoints to query compact precomputed documents rather than scanning millions of raw logs on demand.

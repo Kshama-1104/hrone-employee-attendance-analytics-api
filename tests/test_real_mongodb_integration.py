@@ -1034,6 +1034,63 @@ def test_real_mongo_concurrency_punch_in_and_punch_out(real_db, client):
     assert closed_doc["work_hours"] == 9.0
 
 
+def test_real_mongo_startup_readiness_delay_and_auth_failure():
+    """
+    20-Second Startup Readiness & Failure Mode Verification:
+    - Verifies transient startup delays retry cleanly and succeed within deadline.
+    - Verifies authentication/configuration errors fail immediately without retrying.
+    - Verifies permanent connection failures abort with RuntimeError within deadline.
+    """
+    from unittest.mock import patch
+    import time
+
+    # Case A: Transient delay recovery
+    attempts = 0
+    orig_ci = pymongo.collection.Collection.create_index
+    def flaky_ci(self, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise pymongo.errors.ConnectionFailure("Simulated container startup delay")
+        return orig_ci(self, *args, **kwargs)
+
+    t0 = time.perf_counter()
+    with patch("pymongo.collection.Collection.create_index", new=flaky_ci):
+        app_module.ensure_indexes(max_wait_seconds=5.0)
+    t_elapsed = time.perf_counter() - t0
+    assert attempts > 2
+    assert t_elapsed < 5.0
+
+    # Case B: Fatal auth/operation failure fails fast without retrying
+    auth_attempts = 0
+    def auth_fail_ci(self, *args, **kwargs):
+        nonlocal auth_attempts
+        auth_attempts += 1
+        raise pymongo.errors.OperationFailure("Authentication failed", code=18)
+
+    t0_auth = time.perf_counter()
+    with patch("pymongo.collection.Collection.create_index", new=auth_fail_ci):
+        with pytest.raises(RuntimeError) as exc_info:
+            app_module.ensure_indexes(max_wait_seconds=5.0)
+    t_auth_elapsed = time.perf_counter() - t0_auth
+    assert auth_attempts == 1
+    assert "Database initialization failed" in str(exc_info.value)
+    assert t_auth_elapsed < 1.0
+
+    # Case C: Permanent connection failure aborts within deadline
+    def perm_fail_ci(self, *args, **kwargs):
+        raise pymongo.errors.ConnectionFailure("Down permanently")
+
+    t0_perm = time.perf_counter()
+    with patch("pymongo.collection.Collection.create_index", new=perm_fail_ci):
+        with pytest.raises(RuntimeError) as exc_info:
+            app_module.ensure_indexes(max_wait_seconds=1.0)
+    t_perm_elapsed = time.perf_counter() - t0_perm
+    assert "startup deadline" in str(exc_info.value)
+    assert t_perm_elapsed < 2.0
+
+
+
 
 
 
