@@ -11,6 +11,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import logging
 import os
 import re
+import time as time_mod
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
 from dotenv import load_dotenv
@@ -21,7 +22,8 @@ from pymongo import MongoClient
 import pymongo
 import pymongo.errors
 
-load_dotenv()
+# Ensure actual OS environment variables take priority over local .env
+load_dotenv(override=False)
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.getenv("MONGO_DB", "attendance_db")
@@ -34,31 +36,57 @@ UTC = timezone.utc
 logger = logging.getLogger("uvicorn.error")
 
 
-def ensure_indexes():
-    """Idempotently create required indexes across collections."""
-    # Collection: employees
-    db.employees.create_index([("emp_code", 1)], unique=True, name="uniq_emp_code")
-    db.employees.create_index([("department", 1), ("joined_on", 1)], name="idx_dept_joined")
-    db.employees.create_index([("joined_on", 1)], name="idx_joined_on")
+def ensure_indexes(max_wait_seconds: float = 18.0):
+    """
+    Idempotently create required indexes across collections with bounded retry.
+    Complies with the 20-second startup readiness requirement without arbitrary delay.
+    Fails fast on fatal configuration/auth errors.
+    """
+    start_time = time_mod.time()
+    delay = 0.25
+    while True:
+        try:
+            # Collection: employees
+            db.employees.create_index([("emp_code", 1)], unique=True, name="uniq_emp_code")
+            db.employees.create_index([("department", 1), ("joined_on", 1)], name="idx_dept_joined")
+            db.employees.create_index([("joined_on", 1)], name="idx_joined_on")
 
-    # Collection: attendance_logs
-    db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True, name="uniq_emp_date")
-    db.attendance_logs.create_index([("date", -1), ("emp_code", 1)], name="idx_date_emp")
-    db.attendance_logs.create_index([("emp_code", 1), ("date", 1), ("status", 1)], name="idx_emp_date_status")
-    db.attendance_logs.create_index([("date", 1), ("status", 1)], name="idx_date_status")
-    db.attendance_logs.create_index([("date", 1), ("late_minutes", 1)], name="idx_date_late_minutes")
-    db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)], name="idx_emp_punch_in")
-    logger.info("MongoDB indexes verified successfully.")
+            # Collection: attendance_logs
+            db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True, name="uniq_emp_date")
+            db.attendance_logs.create_index([("date", -1), ("emp_code", 1)], name="idx_date_emp")
+            db.attendance_logs.create_index([("emp_code", 1), ("date", 1), ("status", 1)], name="idx_emp_date_status")
+            db.attendance_logs.create_index([("date", 1), ("status", 1)], name="idx_date_status")
+            db.attendance_logs.create_index([("date", 1), ("late_minutes", 1)], name="idx_date_late_minutes")
+            db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)], name="idx_emp_punch_in")
+            logger.info("MongoDB indexes verified successfully.")
+            return
+        except pymongo.errors.OperationFailure as exc:
+            logger.error(f"Fatal MongoDB operation failure during startup: {exc}")
+            raise RuntimeError(f"Database initialization failed: {exc}") from exc
+        except (pymongo.errors.ConnectionFailure, pymongo.errors.ServerSelectionTimeoutError) as exc:
+            elapsed = time_mod.time() - start_time
+            if elapsed + delay >= max_wait_seconds:
+                logger.error(
+                    f"MongoDB connection timed out after {elapsed:.2f}s (deadline: {max_wait_seconds}s): {exc}"
+                )
+                raise RuntimeError(
+                    f"Database initialization failed within {max_wait_seconds}s startup deadline: {exc}"
+                ) from exc
+            logger.warning(
+                f"MongoDB not ready yet ({elapsed:.2f}s elapsed), retrying in {delay:.2f}s..."
+            )
+            time_mod.sleep(delay)
+            delay = min(delay * 1.5, 2.0)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
         ensure_indexes()
+        yield
     except Exception as exc:
         logger.error(f"Failed to initialize required MongoDB indexes at startup: {exc}")
         raise RuntimeError(f"Database initialization failed: {exc}") from exc
-    yield
 
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
@@ -400,29 +428,44 @@ def punch_out(body: PunchOutRequest):
     truncated_ms = truncate_to_seconds(raw_ms)
     punch_out_utc = ms_to_utc_dt(truncated_ms)
 
-    # Find the most recent open record whose punch_in <= punch_out_utc
-    open_record = db.attendance_logs.find_one(
-        {"emp_code": body.emp_code, "punch_out": None, "punch_in": {"$lte": punch_out_utc}},
+    # 1. Find the most recent record whose non-null punch_in is <= punch_out_utc.
+    # Note: Seeded ABSENT and LEAVE records have punch_in: null and must not match.
+    recent_record = db.attendance_logs.find_one(
+        {
+            "emp_code": body.emp_code,
+            "punch_in": {"$ne": None, "$lte": punch_out_utc},
+        },
         sort=[("punch_in", -1)],
     )
 
-    if not open_record:
+    if not recent_record:
         # Check if an open record exists with punch_in > punch_out_utc
         newer_open = db.attendance_logs.find_one(
-            {"emp_code": body.emp_code, "punch_out": None, "punch_in": {"$gt": punch_out_utc}},
+            {
+                "emp_code": body.emp_code,
+                "punch_out": None,
+                "punch_in": {"$ne": None, "$gt": punch_out_utc},
+            },
             sort=[("punch_in", 1)],
         )
         if newer_open:
             raise HTTPException(status_code=422, detail="punched_at must be strictly after punch_in")
 
-        # Check if the latest record is already punched out
-        latest_record = db.attendance_logs.find_one({"emp_code": body.emp_code}, sort=[("punch_in", -1)])
-        if latest_record and latest_record.get("punch_out") is not None:
-            raise HTTPException(status_code=409, detail="Record is already punched out")
-
         raise HTTPException(status_code=404, detail="No punch-in found")
 
-    punch_in_utc = ensure_utc(open_record["punch_in"])
+    # 2. Check if that record is already punched out
+    if recent_record.get("punch_out") is not None:
+        # Only report 409 if the punch-out attempt falls within the 24-hour shift window of that record
+        punch_in_dt = ensure_utc(recent_record["punch_in"])
+        dur_since_in = (punch_out_utc - punch_in_dt).total_seconds()
+        if dur_since_in <= 86400:
+            raise HTTPException(status_code=409, detail="Record is already punched out")
+        else:
+            raise HTTPException(status_code=404, detail="No punch-in found")
+
+    punch_in_utc = ensure_utc(recent_record.get("punch_in"))
+    if punch_in_utc is None:
+        raise HTTPException(status_code=404, detail="No punch-in found")
 
     dur_seconds = (punch_out_utc - punch_in_utc).total_seconds()
     if dur_seconds <= 0 or dur_seconds > 86400:
@@ -431,12 +474,12 @@ def punch_out(body: PunchOutRequest):
     work_hours = compute_work_hours(punch_in_utc, punch_out_utc)
     shift_start = emp.get("shift_start", "09:30")
     shift_end = emp.get("shift_end", "18:30")
-    ot_min = compute_overtime(punch_out_utc, shift_end, open_record["date"], shift_start)
+    ot_min = compute_overtime(punch_out_utc, shift_end, recent_record["date"], shift_start)
     half_day = bool(work_hours < 4.50)
 
     # Concurrency safe atomic update
     updated_record = db.attendance_logs.find_one_and_update(
-        {"_id": open_record["_id"], "punch_out": None},
+        {"_id": recent_record["_id"], "punch_out": None},
         {
             "$set": {
                 "punch_out": punch_out_utc,

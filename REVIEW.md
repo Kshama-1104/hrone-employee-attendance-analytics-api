@@ -56,4 +56,14 @@ List every defect you found in the starter `app/main.py` (helpers and endpoints)
 |---|---|---|---|---|
 | D1 | Date Validation (`app/main.py`) | Python 3.11 `date.fromisoformat` accepts non-standard ISO representations (compact `20260701`, week-date `2026-W27-3`) instead of strict `YYYY-MM-DD` calendar dates across attendance listing, regularization, department trend, and admin explain. | Strict date format compliance audit. | Implemented `CALENDAR_DATE_REGEX` and `parse_strict_date()` helper across all date-accepting endpoints, strictly enforcing `YYYY-MM-DD` and real calendar date validation, returning HTTP 422 for compact, week-date, impossible, and reversed date ranges. |
 
+---
+
+## Phase 7 Senior QA / SDE Audit Remediations
+
+| # | Where (function / component) | What was wrong / Risk identified | How noticed | Remediation |
+|---|---|---|---|---|
+| E1 | `punch_out` (`app/main.py:445-495`) | Query semantics risk where BSON null or missing `punch_in` in seeded `ABSENT`/`LEAVE` records could falsely match or cause subtractive `TypeError` (HTTP 500) instead of HTTP 404. Furthermore, employees with old closed records (>24h ago) erroneously received false `409 Conflict` when punching out today without a punch-in. | Senior QA Finding 1 investigation and reproduction against seeded ABSENT/LEAVE records. | Hardened query filter to explicitly enforce `punch_in: {"$ne": None, "$lte": punch_out_utc}`. Guarded null punch_in fallback to return 404, isolated closed record 409 checks strictly to valid 24-hour shift windows, and maintained atomic `find_one_and_update` concurrency safety. |
+| E2 | `ensure_indexes` / `lifespan` (`app/main.py:38-95`) | Startup lifespan failed immediately on slow container initialization if MongoDB took >2 seconds, risking premature abort before the 20-second readiness deadline. | Senior QA Finding 2 startup timeout investigation. | Implemented bounded exponential backoff retry loop (`max_wait_seconds=18.0`) in `ensure_indexes` safely below the 20-second contract threshold, failing fast on fatal auth errors while gracefully waiting for MongoDB readiness. |
+
+
 

@@ -35,7 +35,7 @@ MONGO_DB=attendance_db
 ```
 For integration testing against a dedicated test database:
 ```env
-MONGO_URI=mongodb://<username>:<password>@127.0.0.1:27017/hrone_attendance_test?authSource=admin
+MONGO_URI=mongodb://localhost:27017
 MONGO_DB=hrone_attendance_test
 ```
 

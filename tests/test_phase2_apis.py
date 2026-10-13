@@ -595,3 +595,115 @@ def test_regularize_legacy_missing_history_and_half_day(client, mock_db):
     assert "half_day" not in h0["changes"]
     assert "punch_in" in h0["changes"]
 
+
+def test_punch_out_absent_leave_and_shift_boundary_cases(client, mock_db):
+    """
+    Regression test for Finding 1:
+    Ensure punch-out handles ABSENT/LEAVE records with null punch_in, expired closed records,
+    and valid open records with the exact contract status codes (404, 409, 422, 200).
+    """
+    mock_db.employees.insert_one({
+        "emp_code": "EMP_BOUND_01",
+        "name": "Boundary Tester",
+        "email": "bound@example.com",
+        "department": "QA",
+        "shift_start": "09:30",
+        "shift_end": "18:30",
+        "joined_on": "2026-01-01",
+        "created_at": datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+    })
+
+    # Case 1: Employee with ONLY an ABSENT record (punch_in: null) -> 404
+    mock_db.attendance_logs.insert_one({
+        "emp_code": "EMP_BOUND_01",
+        "date": "2026-07-06",
+        "status": "ABSENT",
+        "punch_in": None,
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": 0,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    })
+    res_absent = client.post("/attendance/punch-out", json={"emp_code": "EMP_BOUND_01"})
+    assert res_absent.status_code == 404
+    assert res_absent.json()["detail"] == "No punch-in found"
+
+    # Case 2: Employee with ONLY a LEAVE record (punch_in: null) -> 404
+    mock_db.attendance_logs.delete_many({"emp_code": "EMP_BOUND_01"})
+    mock_db.attendance_logs.insert_one({
+        "emp_code": "EMP_BOUND_01",
+        "date": "2026-07-07",
+        "status": "LEAVE",
+        "punch_in": None,
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": 0,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    })
+    res_leave = client.post("/attendance/punch-out", json={"emp_code": "EMP_BOUND_01"})
+    assert res_leave.status_code == 404
+    assert res_leave.json()["detail"] == "No punch-in found"
+
+    # Case 3: Employee punched out 3 days ago (closed), today is ABSENT -> 404 (NOT 409)
+    mock_db.attendance_logs.delete_many({"emp_code": "EMP_BOUND_01"})
+    old_pin = datetime(2026, 7, 3, 4, 0, 0, tzinfo=timezone.utc)
+    old_pout = datetime(2026, 7, 3, 13, 0, 0, tzinfo=timezone.utc)
+    mock_db.attendance_logs.insert_one({
+        "emp_code": "EMP_BOUND_01",
+        "date": "2026-07-03",
+        "status": "PRESENT",
+        "punch_in": old_pin,
+        "punch_out": old_pout,
+        "work_hours": 9.0,
+        "late_minutes": 0,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    })
+    mock_db.attendance_logs.insert_one({
+        "emp_code": "EMP_BOUND_01",
+        "date": "2026-07-06",
+        "status": "ABSENT",
+        "punch_in": None,
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": 0,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    })
+    # Attempting punch-out on 2026-07-06 must return 404, not falsely report 409 on the old record
+    pout_today_ms = int(datetime(2026, 7, 6, 13, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    res_old = client.post("/attendance/punch-out", json={"emp_code": "EMP_BOUND_01", "punched_at": pout_today_ms})
+    assert res_old.status_code == 404
+    assert res_old.json()["detail"] == "No punch-in found"
+
+    # Case 4: Open record exists, punched out within shift -> 200, second punch-out -> 409
+    pin_today = datetime(2026, 7, 6, 4, 0, 0, tzinfo=timezone.utc)
+    mock_db.attendance_logs.delete_many({"emp_code": "EMP_BOUND_01", "date": "2026-07-06"})
+    mock_db.attendance_logs.insert_one({
+        "emp_code": "EMP_BOUND_01",
+        "date": "2026-07-06",
+        "status": "PRESENT",
+        "punch_in": pin_today,
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": 0,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    })
+    res_success = client.post("/attendance/punch-out", json={"emp_code": "EMP_BOUND_01", "punched_at": pout_today_ms})
+    assert res_success.status_code == 200
+    assert res_success.json()["work_hours"] == 9.0
+
+    # Immediate second punch-out attempt -> 409
+    res_duplicate = client.post("/attendance/punch-out", json={"emp_code": "EMP_BOUND_01", "punched_at": pout_today_ms + 1000})
+    assert res_duplicate.status_code == 409
+    assert res_duplicate.json()["detail"] == "Record is already punched out"
+
+

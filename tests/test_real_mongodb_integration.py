@@ -838,4 +838,202 @@ def test_real_mongo_strict_date_validation_and_range_ordering(client, real_db):
     assert client.get("/admin/explain/department_trend?department=QA&from=2026-07-10&to=2026-07-01").status_code == 422
 
 
+# --------------------------------------------------------------------------- #
+# 19. Real MongoDB Punch-Out Null/ABSENT/LEAVE Semantics & Startup Reliability
+# --------------------------------------------------------------------------- #
+def test_real_mongo_punch_out_absent_leave_and_boundary_cases(real_db, client):
+    """
+    Finding 1 Verification on Real MongoDB 6.0+:
+    Verifies that real MongoDB BSON type semantics do not mistakenly match null punch_in
+    for ABSENT and LEAVE documents, and correctly isolates expired shift records.
+    """
+    real_db.employees.insert_one({
+        "emp_code": "REAL_PUNCH_01",
+        "name": "Punch Real",
+        "email": "punchreal@example.com",
+        "department": "Engineering",
+        "shift_start": "09:30",
+        "shift_end": "18:30",
+        "joined_on": "2026-01-01",
+        "created_at": datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+    })
+
+    # Case 1: Seeded ABSENT record in real MongoDB with punch_in: null
+    real_db.attendance_logs.insert_one({
+        "emp_code": "REAL_PUNCH_01",
+        "date": "2026-07-10",
+        "status": "ABSENT",
+        "punch_in": None,
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": 0,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    })
+    res_absent = client.post("/attendance/punch-out", json={"emp_code": "REAL_PUNCH_01"})
+    assert res_absent.status_code == 404
+    assert res_absent.json()["detail"] == "No punch-in found"
+
+    # Case 2: Seeded LEAVE record in real MongoDB with punch_in: null
+    real_db.attendance_logs.delete_many({"emp_code": "REAL_PUNCH_01"})
+    real_db.attendance_logs.insert_one({
+        "emp_code": "REAL_PUNCH_01",
+        "date": "2026-07-11",
+        "status": "LEAVE",
+        "punch_in": None,
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": 0,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    })
+    res_leave = client.post("/attendance/punch-out", json={"emp_code": "REAL_PUNCH_01"})
+    assert res_leave.status_code == 404
+    assert res_leave.json()["detail"] == "No punch-in found"
+
+    # Case 3: Seeded closed record from 48h ago, and an ABSENT record today
+    real_db.attendance_logs.delete_many({"emp_code": "REAL_PUNCH_01"})
+    old_in = datetime(2026, 7, 8, 4, 0, 0, tzinfo=timezone.utc)
+    old_out = datetime(2026, 7, 8, 13, 0, 0, tzinfo=timezone.utc)
+    real_db.attendance_logs.insert_one({
+        "emp_code": "REAL_PUNCH_01",
+        "date": "2026-07-08",
+        "status": "PRESENT",
+        "punch_in": old_in,
+        "punch_out": old_out,
+        "work_hours": 9.0,
+        "late_minutes": 0,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    })
+    real_db.attendance_logs.insert_one({
+        "emp_code": "REAL_PUNCH_01",
+        "date": "2026-07-10",
+        "status": "ABSENT",
+        "punch_in": None,
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": 0,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    })
+    target_pout_ms = int(datetime(2026, 7, 10, 13, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    res_expired = client.post(
+        "/attendance/punch-out",
+        json={"emp_code": "REAL_PUNCH_01", "punched_at": target_pout_ms},
+    )
+    assert res_expired.status_code == 404
+    assert res_expired.json()["detail"] == "No punch-in found"
+
+    # Case 4: Valid open attendance on real MongoDB
+    valid_pin = datetime(2026, 7, 10, 4, 0, 0, tzinfo=timezone.utc)
+    real_db.attendance_logs.delete_many({"emp_code": "REAL_PUNCH_01", "date": "2026-07-10"})
+    real_db.attendance_logs.insert_one({
+        "emp_code": "REAL_PUNCH_01",
+        "date": "2026-07-10",
+        "status": "PRESENT",
+        "punch_in": valid_pin,
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": 0,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    })
+    res_ok = client.post(
+        "/attendance/punch-out",
+        json={"emp_code": "REAL_PUNCH_01", "punched_at": target_pout_ms},
+    )
+    assert res_ok.status_code == 200
+    assert res_ok.json()["work_hours"] == 9.0
+
+    # Repeat punch-out on same shift yields 409
+    res_conflict = client.post(
+        "/attendance/punch-out",
+        json={"emp_code": "REAL_PUNCH_01", "punched_at": target_pout_ms + 1000},
+    )
+    assert res_conflict.status_code == 409
+    assert res_conflict.json()["detail"] == "Record is already punched out"
+
+
+def test_real_mongo_startup_reliability_and_indexes(real_mongo_client):
+    """
+    Finding 2 Verification:
+    Verifies that ensure_indexes executes successfully and idempotently against live MongoDB 6.0+.
+    """
+    # ensure_indexes should execute cleanly and idempotently
+    app_module.ensure_indexes(max_wait_seconds=5.0)
+
+    # Verify indexes exist on real collections
+    emp_indexes = app_module.db.employees.index_information()
+    assert "uniq_emp_code" in emp_indexes
+    assert "idx_dept_joined" in emp_indexes
+    assert "idx_joined_on" in emp_indexes
+
+    att_indexes = app_module.db.attendance_logs.index_information()
+    assert "uniq_emp_date" in att_indexes
+    assert "idx_date_emp" in att_indexes
+    assert "idx_emp_punch_in" in att_indexes
+
+
+def test_real_mongo_concurrency_punch_in_and_punch_out(real_db, client):
+    """
+    Real MongoDB 6.0+ Concurrency Guarantee Verification:
+    - Parallel punch-ins for same employee/date yield exactly one 201, remainder 409
+    - Parallel punch-outs for same open record yield exactly one 200, remainder 409
+    Asserts both response status codes and underlying MongoDB document state.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    # Setup employee
+    real_db.employees.delete_many({"emp_code": "RACE_REAL_01"})
+    real_db.attendance_logs.delete_many({"emp_code": "RACE_REAL_01"})
+    real_db.employees.insert_one({
+        "emp_code": "RACE_REAL_01",
+        "name": "Race Real",
+        "email": "racereal@example.com",
+        "department": "Engineering",
+        "shift_start": "09:30",
+        "shift_end": "18:30",
+        "joined_on": "2026-01-01",
+        "created_at": datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+    })
+
+    # Part A: Concurrent Punch-Ins on Real MongoDB
+    pin_ts = int(datetime(2026, 7, 6, 4, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    def do_punch_in(i):
+        cli = TestClient(app)
+        return cli.post("/attendance/punch-in", json={"emp_code": "RACE_REAL_01", "punched_at": pin_ts}).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        pin_results = list(executor.map(do_punch_in, range(8)))
+
+    assert pin_results.count(201) == 1
+    assert pin_results.count(409) == 7
+    # Assert DB state has exactly 1 document
+    assert real_db.attendance_logs.count_documents({"emp_code": "RACE_REAL_01", "date": "2026-07-06"}) == 1
+
+    # Part B: Concurrent Punch-Outs on Real MongoDB
+    pout_ts = int(datetime(2026, 7, 6, 13, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    def do_punch_out(i):
+        cli = TestClient(app)
+        return cli.post("/attendance/punch-out", json={"emp_code": "RACE_REAL_01", "punched_at": pout_ts}).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        pout_results = list(executor.map(do_punch_out, range(8)))
+
+    assert pout_results.count(200) == 1
+    assert pout_results.count(409) == 7
+    # Assert DB state has closed record with non-null punch_out and 9.0 work hours
+    closed_doc = real_db.attendance_logs.find_one({"emp_code": "RACE_REAL_01", "date": "2026-07-06"})
+    assert closed_doc["punch_out"] is not None
+    assert closed_doc["work_hours"] == 9.0
+
+
+
+
 
