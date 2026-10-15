@@ -1034,7 +1034,7 @@ def test_real_mongo_concurrency_punch_in_and_punch_out(real_db, client):
     assert closed_doc["work_hours"] == 9.0
 
 
-def test_real_mongo_startup_readiness_delay_and_auth_failure():
+def test_real_mongo_startup_readiness_delay_and_auth_failure(real_mongo_client):
     """
     20-Second Startup Readiness & Failure Mode Verification:
     - Verifies transient startup delays retry cleanly and succeed within deadline.
